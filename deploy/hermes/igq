@@ -1,0 +1,728 @@
+#!/usr/bin/env python3
+"""igq — scheduled Instagram Reels through OpenInstaDM.
+
+    igq add --account pink.trainer --at "2026-11-27 19:00" --video clip.mp4 \
+            --caption-file caption.txt [--cover cover.png | --thumb-ms 3000] \
+            [--keyword GUIA ... --dm-file dm.txt [--link URL --link-label TXT]]
+    igq list [--all]          igq show ID
+    igq cancel ID             igq edit ID [--at ...] [--caption-file ...] ...
+    igq run                   (called every minute by the systemd timer)
+
+`--at` is Europe/Madrid local time ("YYYY-MM-DD HH:MM") or "now".
+
+Each job lives in ~/.hermes/reels/<id>/ (job.json + media). The runner
+publishes due jobs one at a time: it serves the video through a temporary
+Cloudflare quick tunnel, creates the Reel container, waits for Instagram to
+process it, publishes, then creates the comment→DM campaign in OpenInstaDM and
+reports to Telegram. State is saved after every step so a crash or retry never
+publishes the same Reel twice.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+TZ = ZoneInfo("Europe/Madrid")
+HOME = Path.home()
+HERMES = Path(os.environ.get("HERMES_HOME", HOME / ".hermes"))
+ROOT = HERMES / "reels"
+HEADER_FILE = Path(os.environ.get("OPENINSTADM_HEADER_FILE", HERMES / "openinstadm.header"))
+ENV_FILE = HERMES / ".env"
+BASE = os.environ.get("OPENINSTADM_URL", "https://openinstadm-danielsb33.vercel.app")
+
+MAX_ATTEMPTS = 3
+RETRY_DELAY = timedelta(minutes=5)
+PROCESS_TIMEOUT = 20 * 60  # seconds Instagram may take to process a video
+KEEP_MEDIA_DAYS = 7
+MAX_CAPTION = 2200
+MAX_HASHTAGS = 30
+MAX_VIDEO_BYTES = 300 * 1024 * 1024
+
+# Job states
+PENDING, PUBLISHING, PUBLISHED, DONE, FAILED, CANCELLED = (
+    "pending", "publishing", "published", "done", "failed", "cancelled")
+ACTIVE = {PENDING, PUBLISHING, PUBLISHED}
+
+
+class UserError(Exception):
+    """A problem the person has to fix (bad input); never retried."""
+
+
+# ── small helpers ────────────────────────────────────────────────────────────
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def parse_iso(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+def local(dt: datetime) -> str:
+    return dt.astimezone(TZ).strftime("%a %d/%m/%Y %H:%M")
+
+
+def parse_when(value: str, now: datetime | None = None) -> datetime:
+    """Parse Europe/Madrid local time ("YYYY-MM-DD HH:MM") or "now"."""
+    now = now or now_utc()
+    if value.strip().lower() in {"now", "ya", "ahora"}:
+        return now
+    try:
+        naive = datetime.strptime(value.strip(), "%Y-%m-%d %H:%M")
+    except ValueError:
+        raise UserError(f"hora no válida '{value}': usa 'AAAA-MM-DD HH:MM' (hora de Madrid) o 'now'")
+    when = naive.replace(tzinfo=TZ)
+    if when < now - timedelta(minutes=2):
+        raise UserError(f"{local(when)} ya ha pasado")
+    return when.astimezone(timezone.utc)
+
+
+def check_caption(caption: str) -> str:
+    if len(caption) > MAX_CAPTION:
+        raise UserError(f"el caption tiene {len(caption)} caracteres (máx. {MAX_CAPTION})")
+    if len(re.findall(r"#\w", caption)) > MAX_HASHTAGS:
+        raise UserError(f"el caption tiene más de {MAX_HASHTAGS} hashtags")
+    return caption
+
+
+def build_campaign(spec: dict, media_id: str, permalink: str | None,
+                   account_id: str) -> dict:
+    """Body for POST /api/automations targeting the freshly published Reel."""
+    body = {k: v for k, v in spec.items() if v not in (None, "", [])}
+    body.update({
+        "instagramAccountId": account_id,
+        "postId": media_id,
+        "pendingNextReel": False,
+        "matchAnyPost": False,
+        "isActive": True,
+    })
+    if permalink:
+        body["postUrl"] = permalink
+    return body
+
+
+def read_text_arg(text: str | None, path: str | None) -> str | None:
+    if path:
+        return Path(path).read_text(encoding="utf-8").strip()
+    return text.strip() if text is not None else None
+
+
+# ── OpenInstaDM API ─────────────────────────────────────────────────────────
+
+def auth_header() -> tuple[str, str]:
+    line = HEADER_FILE.read_text().strip()
+    name, _, value = line.partition(":")
+    return name.strip(), value.strip()
+
+
+def api(method: str, path: str, body: dict | None = None, timeout: int = 90) -> dict:
+    name, value = auth_header()
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(BASE + path, data=data, method=method)
+    req.add_header(name, value)
+    req.add_header("Accept", "application/json")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            return json.loads(res.read() or b"{}")
+    except urllib.error.HTTPError as err:
+        try:
+            detail = json.loads(err.read()).get("error")
+        except Exception:
+            detail = None
+        raise RuntimeError(f"OpenInstaDM {method} {path.split('?')[0]} → {err.code}: {detail or err.reason}")
+
+
+def resolve_account(name_or_id: str) -> dict:
+    wanted = name_or_id.lstrip("@").lower()
+    accounts = api("GET", "/api/instagram/accounts")["data"]["instagramAccounts"]
+    for acc in accounts:
+        if acc["id"] == name_or_id or acc["username"].lower() == wanted:
+            return {"id": acc["id"], "username": acc["username"]}
+    names = ", ".join(a["username"] for a in accounts)
+    raise UserError(f"no encuentro la cuenta '{name_or_id}' (hay: {names})")
+
+
+# ── Telegram ────────────────────────────────────────────────────────────────
+
+def read_env() -> dict[str, str]:
+    env: dict[str, str] = {}
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                key, _, value = line.partition("=")
+                env[key.strip()] = value.strip().strip('"').strip("'")
+    return env
+
+
+def notify(text: str) -> None:
+    env = read_env()
+    token = env.get("TELEGRAM_BOT_TOKEN")
+    chat = (env.get("TELEGRAM_HOME_CHANNEL")
+            or env.get("TELEGRAM_ALLOWED_USERS", "").split(",")[0].strip())
+    if not token or not chat:
+        print(f"[igq] (sin Telegram) {text}", file=sys.stderr)
+        return
+    data = urllib.parse.urlencode({
+        "chat_id": chat, "text": text, "disable_web_page_preview": "true"}).encode()
+    try:
+        urllib.request.urlopen(
+            f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=30).read()
+    except Exception as err:  # a failed notification must not fail the job
+        print(f"[igq] no se pudo avisar por Telegram: {err}", file=sys.stderr)
+
+
+# ── jobs on disk ────────────────────────────────────────────────────────────
+
+def job_dir(job_id: str) -> Path:
+    if not re.fullmatch(r"r-[0-9a-z-]+", job_id):
+        raise UserError(f"id de publicación no válido: {job_id}")
+    path = ROOT / job_id
+    if not (path / "job.json").exists():
+        raise UserError(f"no existe la publicación {job_id}")
+    return path
+
+
+def load(job_id: str) -> dict:
+    return json.loads((job_dir(job_id) / "job.json").read_text())
+
+
+def save(job: dict) -> None:
+    path = ROOT / job["id"] / "job.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(job, ensure_ascii=False, indent=2))
+    tmp.replace(path)  # atomic: a crash never leaves half a job.json
+
+
+def all_jobs() -> list[dict]:
+    jobs = []
+    for path in sorted(ROOT.glob("r-*/job.json")):
+        try:
+            jobs.append(json.loads(path.read_text()))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return sorted(jobs, key=lambda j: j["at"])
+
+
+def log(job: dict, message: str) -> None:
+    job.setdefault("log", []).append(f"{iso(now_utc())} {message}")
+    print(f"[igq] {job['id']}: {message}", file=sys.stderr)
+
+
+# ── media checks ────────────────────────────────────────────────────────────
+
+GDRIVE = re.compile(r"drive\.google\.com/(?:file/d/|open\?id=|uc\?(?:.*&)?id=)([\w-]+)")
+
+
+def direct_url(url: str) -> str:
+    match = GDRIVE.search(url)
+    if match:
+        return f"https://drive.usercontent.google.com/download?id={match.group(1)}&export=download&confirm=t"
+    if "dropbox.com" in url:
+        return re.sub(r"([?&])dl=0", r"\1dl=1", url) if "dl=0" in url else url + ("&" if "?" in url else "?") + "dl=1"
+    return url
+
+
+def fetch(src: str, dest: Path) -> None:
+    if re.match(r"https?://", src):
+        subprocess.run(["curl", "-fsSL", "--max-time", "900", "-o", str(dest), direct_url(src)],
+                       check=True)
+    else:
+        source = Path(src).expanduser()
+        if not source.is_file():
+            raise UserError(f"no encuentro el archivo {src}")
+        shutil.copyfile(source, dest)
+
+
+def probe(path: Path) -> dict:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+        capture_output=True, text=True)
+    if out.returncode != 0:
+        raise UserError("el archivo no es un vídeo válido")
+    return json.loads(out.stdout)
+
+
+def prepare_video(src: str, dest: Path) -> dict:
+    """Download/copy, check against Reels limits and transcode only if needed."""
+    raw = dest.with_name("source-video")
+    fetch(src, raw)
+    info = probe(raw)
+    video = next((s for s in info["streams"] if s["codec_type"] == "video"), None)
+    audio = next((s for s in info["streams"] if s["codec_type"] == "audio"), None)
+    if not video:
+        raise UserError("el archivo no tiene pista de vídeo (¿es una página web en vez del vídeo?)")
+    duration = float(info["format"].get("duration") or 0)
+    if not 3 <= duration <= 900:
+        raise UserError(f"el vídeo dura {duration:.0f} s; un Reel debe durar entre 3 s y 15 min")
+
+    ok_container = any(x in info["format"].get("format_name", "") for x in ("mp4", "mov"))
+    ok_codecs = video["codec_name"] in ("h264", "hevc") and (audio is None or audio["codec_name"] == "aac")
+    if ok_container and ok_codecs and raw.stat().st_size <= MAX_VIDEO_BYTES:
+        raw.rename(dest)
+    else:
+        print("[igq] convirtiendo el vídeo a MP4 H.264/AAC (puede tardar)…", file=sys.stderr)
+        subprocess.run(
+            ["ffmpeg", "-loglevel", "error", "-y", "-i", str(raw), "-c:v", "libx264",
+             "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac",
+             "-b:a", "128k", "-movflags", "+faststart", str(dest)], check=True)
+        raw.unlink()
+        if dest.stat().st_size > MAX_VIDEO_BYTES:
+            raise UserError("el vídeo pesa más de 300 MB incluso convertido")
+
+    width, height = int(video.get("width", 0)), int(video.get("height", 0))
+    rotation = abs(int((video.get("tags") or {}).get("rotate", 0) or 0))
+    if rotation in (90, 270):
+        width, height = height, width
+    return {"duration": round(duration, 1), "width": width, "height": height,
+            "vertical": height > width}
+
+
+def prepare_cover(src: str, dest: Path) -> None:
+    raw = dest.with_name("source-cover")
+    fetch(src, raw)
+    result = subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y", "-i", str(raw), "-frames:v", "1", "-q:v", "2", str(dest)])
+    raw.unlink(missing_ok=True)
+    if result.returncode != 0:
+        raise UserError("la portada no es una imagen válida")
+
+
+# ── temporary public URL for Meta ───────────────────────────────────────────
+
+class Tunnel:
+    """Serve a folder on localhost and expose it through a Cloudflare quick tunnel."""
+
+    def __init__(self, folder: Path):
+        self.folder = folder
+        self.procs: list[subprocess.Popen] = []
+        self.url = ""
+
+    def __enter__(self) -> "Tunnel":
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        self.procs.append(subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1",
+             "--directory", str(self.folder)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        log_path = self.folder.parent / "tunnel.log"
+        with open(log_path, "w") as log_file:
+            self.procs.append(subprocess.Popen(
+                ["cloudflared", "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"],
+                stdout=log_file, stderr=subprocess.STDOUT))
+        for _ in range(60):
+            found = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", log_path.read_text())
+            if found:
+                self.url = found.group(0)
+                break
+            time.sleep(1)
+        if not self.url:
+            raise RuntimeError("no se pudo abrir el túnel de Cloudflare")
+        return self
+
+    def wait_reachable(self, name: str) -> None:
+        for _ in range(30):
+            try:
+                req = urllib.request.Request(f"{self.url}/{name}", method="HEAD")
+                urllib.request.urlopen(req, timeout=10)
+                return
+            except Exception:
+                time.sleep(3)
+        raise RuntimeError("el túnel no responde")
+
+    def __exit__(self, *_exc) -> None:
+        for proc in reversed(self.procs):
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+# ── the publishing pipeline ─────────────────────────────────────────────────
+
+def container_status(job: dict) -> tuple[str, str | None]:
+    res = api("GET", f"/api/instagram/reels?instagramAccountId={job['account']['id']}"
+                     f"&containerId={job['containerId']}")
+    return res["data"]["statusCode"], res["data"].get("status")
+
+
+def find_published_media(job: dict) -> dict | None:
+    """After an ambiguous publish, find the Reel by caption among the newest posts."""
+    res = api("GET", f"/api/instagram/posts?instagramAccountId={job['account']['id']}"
+                     "&limit=10&refresh=true")
+    posts = res.get("data", {})
+    posts = posts.get("posts", posts) if isinstance(posts, dict) else posts
+    since = parse_iso(job["publishStartedAt"]) - timedelta(minutes=5)
+    for post in posts or []:
+        stamp = post.get("timestamp")
+        if (post.get("caption") or "").strip() == (job.get("caption") or "").strip() and stamp:
+            if datetime.fromisoformat(stamp.replace("+0000", "+00:00")) >= since:
+                return {"mediaId": post["id"], "permalink": post.get("permalink")}
+    return None
+
+
+def publish(job: dict) -> None:
+    """Create container → wait → publish. Records progress after each step."""
+    folder = ROOT / job["id"] / "media"
+    job["state"] = PUBLISHING
+    job["publishStartedAt"] = iso(now_utc())
+    job.pop("containerId", None)  # an unfinished container from a crash is just discarded
+    save(job)
+
+    with Tunnel(folder) as tunnel:
+        tunnel.wait_reachable(job["video"])
+        body = {"instagramAccountId": job["account"]["id"],
+                "videoUrl": f"{tunnel.url}/{job['video']}",
+                "shareToFeed": job.get("shareToFeed", True)}
+        if job.get("caption"):
+            body["caption"] = job["caption"]
+        if job.get("cover"):
+            body["coverUrl"] = f"{tunnel.url}/{job['cover']}"
+        elif job.get("thumbOffsetMs") is not None:
+            body["thumbOffsetMs"] = job["thumbOffsetMs"]
+
+        job["containerId"] = api("POST", "/api/instagram/reels", body)["data"]["containerId"]
+        log(job, f"contenedor {job['containerId']} creado")
+        save(job)
+
+        deadline = time.monotonic() + PROCESS_TIMEOUT
+        while True:
+            time.sleep(15)
+            code, detail = container_status(job)
+            if code == "FINISHED":
+                break
+            if code in ("ERROR", "EXPIRED"):
+                raise RuntimeError(f"Instagram rechazó el vídeo: {detail or code}")
+            if time.monotonic() > deadline:
+                raise RuntimeError("Instagram no terminó de procesar el vídeo en 20 min")
+
+    try:
+        res = api("POST", "/api/instagram/reels/publish",
+                  {"instagramAccountId": job["account"]["id"], "containerId": job["containerId"]})
+        media = {"mediaId": res["data"]["mediaId"], "permalink": res["data"].get("permalink")}
+    except Exception:
+        # The publish may have gone through even though we got no answer.
+        code, _ = container_status(job)
+        media = find_published_media(job) if code == "PUBLISHED" else None
+        if not media:
+            if code == "PUBLISHED":
+                job["state"] = PUBLISHED
+                job["mediaId"] = None
+                save(job)
+                raise RuntimeError("se publicó pero no encuentro el Reel para crear la campaña")
+            raise
+
+    job.update(media)
+    job["state"] = PUBLISHED
+    job["publishedAt"] = iso(now_utc())
+    log(job, f"publicado {media['mediaId']}")
+    save(job)
+
+
+def create_campaign(job: dict) -> None:
+    body = build_campaign(job["campaign"], job["mediaId"], job.get("permalink"),
+                          job["account"]["id"])
+    res = api("POST", "/api/automations", body)
+    job["campaignId"] = res["data"]["id"]
+    log(job, f"campaña {job['campaignId']} creada")
+    save(job)
+
+
+def describe_campaign(job: dict) -> str:
+    spec = job.get("campaign")
+    if not spec:
+        return ""
+    return f"\nCampaña: palabra(s) {', '.join(spec.get('keywords', []))} → DM"
+
+
+def process(job: dict) -> None:
+    job["attempts"] = job.get("attempts", 0) + 1
+    save(job)
+    try:
+        if job["state"] in (PENDING, PUBLISHING):
+            if job.get("containerId") and job["state"] == PUBLISHING:
+                # Crashed mid-publish: never publish twice.
+                code, _ = container_status(job)
+                if code == "PUBLISHED":
+                    media = find_published_media(job)
+                    if not media:
+                        raise RuntimeError("estaba publicado pero no encuentro el Reel")
+                    job.update(media, state=PUBLISHED, publishedAt=iso(now_utc()))
+                    save(job)
+            if job["state"] != PUBLISHED:
+                publish(job)
+            notify(f"✅ Publicado en @{job['account']['username']}\n"
+                   f"{job.get('permalink') or job.get('mediaId')}{describe_campaign(job)}")
+        if job.get("campaign") and not job.get("campaignId"):
+            if not job.get("mediaId"):
+                media = find_published_media(job)
+                if not media:
+                    raise RuntimeError("no encuentro el Reel publicado para crear la campaña")
+                job.update(media)
+                save(job)
+            create_campaign(job)
+            notify(f"🤖 Campaña activa en el Reel de @{job['account']['username']}: "
+                   f"comentan {', '.join(job['campaign']['keywords'])} → reciben el DM")
+        job["state"] = DONE
+        job.pop("error", None)
+        save(job)
+    except Exception as err:
+        job["error"] = str(err)
+        log(job, f"error (intento {job['attempts']}): {err}")
+        published = job.get("state") == PUBLISHED
+        if job["state"] == PUBLISHING:
+            job["state"] = PENDING
+        if job["attempts"] >= MAX_ATTEMPTS:
+            if not published:
+                job["state"] = FAILED
+            job["retryAt"] = None
+            what = ("El Reel SÍ se publicó, pero falló la campaña"
+                    if published else "No se pudo publicar el Reel")
+            notify(f"❌ {what} de @{job['account']['username']} ({job['id']}):\n{err}")
+            if published:
+                job["campaignFailed"] = True
+                job["state"] = FAILED
+        else:
+            job["retryAt"] = iso(now_utc() + RETRY_DELAY)
+        save(job)
+
+
+def due(job: dict, now: datetime) -> bool:
+    if job["state"] not in ACTIVE:
+        return False
+    if parse_iso(job["at"]) > now:
+        return False
+    retry = job.get("retryAt")
+    return not retry or parse_iso(retry) <= now
+
+
+def cleanup(now: datetime) -> None:
+    for job in all_jobs():
+        if job["state"] in (DONE, FAILED, CANCELLED):
+            finished = parse_iso(job.get("publishedAt") or job["at"])
+            media = ROOT / job["id"] / "media"
+            if media.exists() and now - finished > timedelta(days=KEEP_MEDIA_DAYS):
+                shutil.rmtree(media)
+
+
+# ── commands ────────────────────────────────────────────────────────────────
+
+def campaign_from_args(args, existing: dict | None = None) -> dict | None:
+    spec = dict(existing or {})
+    if args.campaign_json:
+        spec.update(json.loads(Path(args.campaign_json).read_text(encoding="utf-8")))
+    if args.keyword:
+        spec["keywords"] = [k.strip() for k in args.keyword if k.strip()]
+    dm = read_text_arg(args.dm, args.dm_file)
+    if dm:
+        spec["dmMessage"] = dm
+    if args.link:
+        spec["trackedDestinationUrl"] = args.link
+    if args.link_label:
+        spec["linkButtonLabel"] = args.link_label
+    if args.public_reply:
+        spec["publicReplyEnabled"] = True
+        spec["publicReplyMessages"] = args.public_reply
+    if args.require_follow:
+        spec["requireFollow"] = True
+    if not spec:
+        return None
+    keywords = spec.get("keywords") or []
+    if not keywords or not spec.get("dmMessage"):
+        raise UserError("la campaña necesita al menos una palabra clave (--keyword) y el DM (--dm-file)")
+    if len(keywords) > 10 or any(len(k) > 50 for k in keywords):
+        raise UserError("máximo 10 palabras clave de hasta 50 caracteres")
+    if len(spec["dmMessage"]) > 1000:
+        raise UserError("el DM no puede pasar de 1000 caracteres")
+    if spec.get("linkButtonLabel") and len(spec["linkButtonLabel"]) > 20:
+        raise UserError("el texto del botón del enlace no puede pasar de 20 caracteres")
+    spec.setdefault("name", None)
+    return spec
+
+
+def summary(job: dict) -> str:
+    parts = [f"{job['id']}  [{job['state']}]  {local(parse_iso(job['at']))}  @{job['account']['username']}"]
+    caption = (job.get("caption") or "").replace("\n", " ")
+    parts.append(f"   caption: {caption[:80]}{'…' if len(caption) > 80 else ''}")
+    if job.get("cover"):
+        parts.append("   portada: imagen propia")
+    elif job.get("thumbOffsetMs") is not None:
+        parts.append(f"   portada: fotograma en {job['thumbOffsetMs'] / 1000:g} s")
+    if job.get("campaign"):
+        parts.append(f"   campaña: {', '.join(job['campaign']['keywords'])} → DM")
+    if job.get("permalink"):
+        parts.append(f"   {job['permalink']}")
+    if job.get("error"):
+        parts.append(f"   último error: {job['error']}")
+    return "\n".join(parts)
+
+
+def cmd_add(args) -> None:
+    account = resolve_account(args.account)
+    when = parse_when(args.at)
+    caption = check_caption(read_text_arg(args.caption, args.caption_file) or "")
+    campaign = campaign_from_args(args)
+    if campaign and not campaign.get("name"):
+        campaign["name"] = f"Reel {local(when)} @{account['username']}"[:100]
+    if args.cover and args.thumb_ms is not None:
+        raise UserError("usa --cover o --thumb-ms, no los dos")
+
+    job_id = f"r-{when.astimezone(TZ):%Y%m%d-%H%M}-{secrets.token_hex(2)}"
+    folder = ROOT / job_id / "media"
+    folder.mkdir(parents=True)
+    token = secrets.token_hex(16)  # unguessable file names while the tunnel is open
+    try:
+        info = prepare_video(args.video, folder / f"{token}.mp4")
+        cover = None
+        if args.cover:
+            cover = f"{token}-cover.jpg"
+            prepare_cover(args.cover, folder / cover)
+    except BaseException:
+        shutil.rmtree(ROOT / job_id, ignore_errors=True)
+        raise
+
+    job = {
+        "id": job_id, "state": PENDING, "createdAt": iso(now_utc()), "at": iso(when),
+        "account": account, "video": f"{token}.mp4", "videoInfo": info,
+        "caption": caption, "cover": cover, "thumbOffsetMs": args.thumb_ms,
+        "shareToFeed": not args.no_feed, "campaign": campaign, "attempts": 0,
+    }
+    save(job)
+    print(summary(job))
+    if not info["vertical"]:
+        print("   aviso: el vídeo no es vertical; Instagram lo mostrará con bandas", file=sys.stderr)
+
+
+def cmd_edit(args) -> None:
+    job = load(args.id)
+    if job["state"] != PENDING:
+        raise UserError(f"{job['id']} está {job['state']}: solo se editan las pendientes")
+    if args.at:
+        job["at"] = iso(parse_when(args.at))
+        job["retryAt"] = None
+    caption = read_text_arg(args.caption, args.caption_file)
+    if caption is not None:
+        job["caption"] = check_caption(caption)
+    if args.thumb_ms is not None:
+        job["thumbOffsetMs"], job["cover"] = args.thumb_ms, None
+    if args.cover:
+        job["cover"] = f"{job['video'][:-4]}-cover.jpg"
+        prepare_cover(args.cover, ROOT / job["id"] / "media" / job["cover"])
+    if args.no_campaign:
+        job["campaign"] = None
+    else:
+        campaign = campaign_from_args(args, job.get("campaign"))
+        if campaign and not campaign.get("name"):
+            campaign["name"] = f"Reel {local(parse_iso(job['at']))} @{job['account']['username']}"[:100]
+        job["campaign"] = campaign
+    save(job)
+    print(summary(job))
+
+
+def cmd_list(args) -> None:
+    jobs = [j for j in all_jobs() if args.all or j["state"] in ACTIVE or j["state"] == FAILED]
+    print("\n".join(summary(j) for j in jobs) if jobs else "No hay publicaciones programadas.")
+
+
+def cmd_show(args) -> None:
+    job = load(args.id)
+    print(summary(job))
+    print(json.dumps({k: job.get(k) for k in ("caption", "campaign", "videoInfo", "log")},
+                     ensure_ascii=False, indent=2))
+
+
+def cmd_cancel(args) -> None:
+    job = load(args.id)
+    if job["state"] != PENDING:
+        raise UserError(f"{job['id']} está {job['state']}: ya no se puede cancelar")
+    job["state"] = CANCELLED
+    save(job)
+    print(f"{job['id']} cancelada")
+
+
+def cmd_run(_args) -> None:
+    ROOT.mkdir(parents=True, exist_ok=True)
+    lock = open(ROOT / ".lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return  # a previous run is still publishing
+    now = now_utc()
+    for job in all_jobs():
+        if due(job, now):
+            process(job)
+    cleanup(now)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="igq", description="Reels programados vía OpenInstaDM")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    def media_opts(p, adding: bool):
+        p.add_argument("--at", required=adding, help="'AAAA-MM-DD HH:MM' (Madrid) o 'now'")
+        p.add_argument("--caption")
+        p.add_argument("--caption-file")
+        p.add_argument("--cover", help="imagen (archivo o URL) para la portada")
+        p.add_argument("--thumb-ms", type=int, help="fotograma de portada en milisegundos")
+        p.add_argument("--keyword", action="append", help="palabra clave de la campaña (repetible)")
+        p.add_argument("--dm")
+        p.add_argument("--dm-file")
+        p.add_argument("--link", help="enlace del botón del DM")
+        p.add_argument("--link-label", help="texto del botón (máx. 20)")
+        p.add_argument("--public-reply", action="append", help="respuesta pública al comentario")
+        p.add_argument("--require-follow", action="store_true")
+        p.add_argument("--campaign-json", help="campos extra de la campaña (JSON)")
+
+    add = sub.add_parser("add")
+    add.add_argument("--account", required=True)
+    add.add_argument("--video", required=True, help="archivo o enlace de descarga")
+    add.add_argument("--no-feed", action="store_true")
+    media_opts(add, True)
+    edit = sub.add_parser("edit")
+    edit.add_argument("id")
+    edit.add_argument("--no-campaign", action="store_true")
+    media_opts(edit, False)
+    lst = sub.add_parser("list")
+    lst.add_argument("--all", action="store_true")
+    for name in ("show", "cancel"):
+        sub.add_parser(name).add_argument("id")
+    sub.add_parser("run")
+
+    args = parser.parse_args(argv)
+    ROOT.mkdir(parents=True, exist_ok=True)
+    try:
+        {"add": cmd_add, "edit": cmd_edit, "list": cmd_list, "show": cmd_show,
+         "cancel": cmd_cancel, "run": cmd_run}[args.cmd](args)
+    except UserError as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+    sys.exit(main())

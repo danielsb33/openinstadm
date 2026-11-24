@@ -1,6 +1,6 @@
 ---
 name: openinstadm
-description: Gestiona las cuentas de Instagram conectadas a OpenInstaDM (estadísticas, publicaciones, bandeja de mensajes, campañas comentario→DM y logs) a través de su API con el comando `ig`.
+description: Gestiona las cuentas de Instagram conectadas a OpenInstaDM (estadísticas, publicaciones, bandeja de mensajes, campañas comentario→DM, logs) y publica o programa Reels con caption, portada y campaña usando `ig` e `igq`.
 ---
 
 # OpenInstaDM (Instagram)
@@ -52,36 +52,60 @@ explícito en el chat. Nunca encadenes envíos masivos.
 | Crear campaña | `ig POST /api/automations '{...}'` (mínimo `name`, `dmMessage`, `instagramAccountId` y `postId` o `matchAnyPost`, `keywords`) |
 | Borrar campaña | `ig DELETE '/api/automations?id=CAMP_ID'` (prefiere pausar) |
 
-## Publicar un Reel (SIEMPRE con confirmación)
+## Publicar Reels (ahora o programados) con `igq`
 
-Usa `ig-reel`, que sirve el vídeo temporalmente, espera a que Instagram lo
-procese (puede tardar varios minutos) y lo publica:
+Todas las publicaciones pasan por la cola `igq`, que vive en este servidor y
+funciona aunque el ordenador del usuario esté apagado. Un temporizador la
+revisa cada minuto: a la hora indicada sube vídeo, caption y portada, publica,
+crea la campaña comentario→DM en OpenInstaDM y avisa por Telegram (✅ con el
+enlace, o ❌ con el error). Reintenta solo 3 veces y nunca publica dos veces.
 
 ```
-ig-reel --account pink.trainer --video /ruta/video.mp4 \
-        --caption-file /tmp/caption.txt [--cover /ruta/portada.jpg | --thumb-ms 3000] [--no-feed]
+igq add --account pink.trainer --at "2026-11-27 19:00" --video /ruta/video.mp4 \
+        --caption-file /tmp/caption.txt [--cover /ruta/portada.png | --thumb-ms 3000] \
+        [--keyword GUIA [--keyword GUÍA] --dm-file /tmp/dm.txt [--link URL --link-label "Descargar"]]
+igq list                 # pendientes y fallidas (--all para todo)
+igq show ID              # detalle y registro
+igq edit ID --at "2026-11-28 10:00"   # o --caption-file, --cover, --thumb-ms, --keyword/--dm-file, --no-campaign
+igq cancel ID
 ```
 
-- `--video`: archivo local (p. ej. el que te mandan por Telegram) o un enlace
-  directo de descarga. Debe ser MP4/MOV vertical (9:16), 3 s – 15 min.
-- Caption: escríbelo en un archivo y pásalo con `--caption-file` (evita
-  problemas con comillas y emojis). Máx. 2200 caracteres, 30 hashtags.
-- Portada: `--cover` con una imagen (se convierte a JPEG sola) o
-  `--thumb-ms` con el milisegundo del fotograma. Sin ninguna, Instagram elige.
-- `--no-feed`: el Reel no aparece en la cuadrícula del perfil.
+- `--at`: hora de **Madrid** en formato `AAAA-MM-DD HH:MM`, o `now` para
+  publicar en el próximo minuto. Convierte tú "mañana a las 7 de la tarde" a
+  fecha exacta (mira la fecha actual con `date`) y enséñasela al usuario.
+- `--video`: la ruta local del vídeo que te mandaron por Telegram, o un enlace
+  (Google Drive y Dropbox se convierten solos a descarga directa). `igq add`
+  descarga, comprueba (3 s – 15 min) y convierte a MP4 H.264 si hace falta,
+  así que los problemas salen al programar, no a la hora de publicar.
+- Caption y DM: escríbelos en archivos (`/tmp/...txt`) y pásalos con
+  `--caption-file` / `--dm-file` para no romper comillas ni emojis.
+- Portada: `--cover` con una imagen (archivo o enlace; se convierte a JPEG) o
+  `--thumb-ms` con el milisegundo del fotograma. Sin ninguna, elige Instagram.
+- Campaña: si el usuario pide "con la automatización" y no da la palabra
+  clave, sácala del caption (p. ej. "Comenta GUÍA" → `--keyword GUIA
+  --keyword GUÍA`) y pide el texto del DM si no lo tienes. Opcional: `--link`
+  (botón con enlace), `--public-reply "¡Te lo envío por DM!"` (repetible),
+  `--require-follow`.
+- `--no-feed`: el Reel no sale en la cuadrícula del perfil.
 
-Antes de ejecutarlo, enseña al usuario: cuenta, vídeo, caption completo y
-portada, y espera un "sí" explícito. Publicar es irreversible desde aquí
-(solo se puede borrar en la app de Instagram). Al terminar, devuelve el
-`permalink`. Si sale 403 sobre permisos, la cuenta debe reconectarse en
-OpenInstaDM para conceder el permiso de publicación. Ejecuta `ig-reel` en
-segundo plano si tu herramienta tiene límite de tiempo: puede tardar >5 min.
+**Confirmación:** antes de `igq add` enseña un resumen con cuenta, fecha y hora
+(día de la semana incluido), caption completo, portada, palabra(s) clave y DM,
+y espera un "sí" explícito. Con ese "sí" queda programado: a la hora indicada
+se publica sin volver a preguntar. Publicar es irreversible desde aquí (solo se
+borra en la app de Instagram). Para cambios usa `igq edit`; `igq cancel` solo
+funciona mientras está pendiente.
+
+Si el usuario pregunta "¿qué tengo programado?", usa `igq list` y resúmelo con
+fechas legibles.
 
 ## Límites que debes respetar
 
 - Instagram solo permite escribir por DM a quien escribió en las últimas 24 h.
 - Solo se pueden publicar Reels (no fotos, carruseles ni historias).
 - Instagram limita las publicaciones por API a unas 50 cada 24 h por cuenta.
+- Vídeos por Telegram: máximo 20 MB; para más, pide un enlace de Drive/Dropbox.
+- Si un aviso dice 403 de permisos, la cuenta debe reconectarse en OpenInstaDM
+  con la sesión de esa cuenta abierta en el navegador.
 - Un 401 significa que la clave del agente falta o es incorrecta; un 403, que
   el usuario no tiene permiso en ese workspace. No reintentes en bucle.
 - Nunca muestres el contenido de `~/.hermes/openinstadm.header`.

@@ -1,0 +1,11 @@
+[Unit]
+Description=Publish due scheduled Instagram Reels (igq)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/igq run
+# One run may wait for Instagram to process several videos.
+TimeoutStartSec=90min
+Nice=5
