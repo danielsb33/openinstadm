@@ -44,12 +44,21 @@ export async function getAgentIdentity(): Promise<AgentIdentity | null> {
   if (!authorization?.startsWith("Bearer ")) return null;
 
   const presented = authorization.slice("Bearer ".length).trim();
-  if (!presented || !isValidAgentKey(presented, expectedKey)) return null;
+  if (!presented || !isValidAgentKey(presented, expectedKey)) {
+    console.warn("[agent-auth] rejected: bearer token does not match AGENT_API_KEY");
+    return null;
+  }
 
   const user = await withDbRetry(() =>
-    prisma.user.findUnique({ where: { email }, select: { id: true } }),
+    prisma.user.findFirst({
+      where: { email: { equals: email, mode: "insensitive" } },
+      select: { id: true },
+    }),
   );
-  if (!user) return null;
+  if (!user) {
+    console.warn("[agent-auth] rejected: no user matches AGENT_USER_EMAIL");
+    return null;
+  }
 
   return {
     userId: user.id,

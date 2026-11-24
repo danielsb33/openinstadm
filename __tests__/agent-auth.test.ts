@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const headerValues = new Map<string, string>();
 
-const findUnique = vi.fn();
+const findFirst = vi.fn();
 
 vi.mock("next/headers", () => ({
   headers: async () => ({
@@ -11,7 +11,7 @@ vi.mock("next/headers", () => ({
 }));
 
 vi.mock("@/lib/db/client", () => ({
-  prisma: { user: { findUnique: (args: unknown) => findUnique(args) } },
+  prisma: { user: { findFirst: (args: unknown) => findFirst(args) } },
   withDbRetry: <T>(fn: () => Promise<T>) => fn(),
 }));
 
@@ -22,10 +22,15 @@ const KEY = "a".repeat(48);
 describe("agent auth", () => {
   beforeEach(() => {
     headerValues.clear();
-    findUnique.mockReset();
-    findUnique.mockImplementation(async ({ where }: { where: { email: string } }) =>
-      where.email === "owner@example.com" ? { id: "user_123" } : null,
+    findFirst.mockReset();
+    // Emulates Postgres `mode: "insensitive"` matching.
+    findFirst.mockImplementation(
+      async ({ where }: { where: { email: { equals: string } } }) =>
+        where.email.equals.toLowerCase() === "owner@example.com"
+          ? { id: "user_123" }
+          : null,
     );
+    vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.stubEnv("AGENT_API_KEY", KEY);
     vi.stubEnv("AGENT_USER_EMAIL", "Owner@Example.com");
   });
@@ -62,7 +67,7 @@ describe("agent auth", () => {
     headerValues.set("authorization", `Bearer ${KEY}`);
     vi.stubEnv("AGENT_USER_EMAIL", "");
     await expect(getAgentIdentity()).resolves.toBeNull();
-    expect(findUnique).not.toHaveBeenCalled();
+    expect(findFirst).not.toHaveBeenCalled();
   });
 
   it("returns null when no user has that email", async () => {
@@ -74,7 +79,7 @@ describe("agent auth", () => {
   it("does not touch the database for a wrong key", async () => {
     headerValues.set("authorization", `Bearer ${"b".repeat(48)}`);
     await getAgentIdentity();
-    expect(findUnique).not.toHaveBeenCalled();
+    expect(findFirst).not.toHaveBeenCalled();
   });
 
   it("compares keys of different lengths safely", () => {
