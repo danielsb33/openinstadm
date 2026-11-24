@@ -811,3 +811,100 @@ export async function debugToken(inputToken: string, accessToken: string) {
   const response = await fetch(url.toString());
   return handleResponse(response);
 }
+
+// ── Content publishing (Reels) ───────────────────────────────────────────────
+// Requires `instagram_business_content_publish`. Publishing is three steps:
+// create a container (Meta downloads `video_url` itself), poll it until
+// `status_code` is FINISHED, then publish it. Video processing can take minutes,
+// so callers drive the polling instead of holding one request open.
+
+export interface CreateReelContainerInput {
+  videoUrl: string;
+  caption?: string;
+  /** Public image URL for a custom cover. Takes precedence over thumbOffset. */
+  coverUrl?: string;
+  /** Frame to use as cover, in milliseconds from the start of the video. */
+  thumbOffsetMs?: number;
+  /** Also show the Reel on the profile grid (Instagram's default is true). */
+  shareToFeed?: boolean;
+}
+
+export type MediaContainerStatusCode =
+  | "IN_PROGRESS"
+  | "FINISHED"
+  | "ERROR"
+  | "EXPIRED"
+  | "PUBLISHED";
+
+export interface MediaContainerStatus {
+  id: string;
+  status_code: MediaContainerStatusCode;
+  /** Human-readable detail Meta adds when processing fails. */
+  status?: string;
+}
+
+export async function createReelContainer(
+  accessToken: string,
+  input: CreateReelContainerInput
+): Promise<{ id: string }> {
+  const body: Record<string, string | number | boolean> = {
+    media_type: "REELS",
+    video_url: input.videoUrl,
+  };
+  if (input.caption) body.caption = input.caption;
+  if (input.coverUrl) body.cover_url = input.coverUrl;
+  else if (input.thumbOffsetMs !== undefined) body.thumb_offset = input.thumbOffsetMs;
+  if (input.shareToFeed !== undefined) body.share_to_feed = input.shareToFeed;
+
+  const response = await fetch(`${instagramGraphBase()}/me/media`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify(body),
+  });
+  return handleResponse(response);
+}
+
+export async function getMediaContainerStatus(
+  accessToken: string,
+  containerId: string
+): Promise<MediaContainerStatus> {
+  const url = new URL(`${instagramGraphBase()}/${containerId}`);
+  url.searchParams.set("fields", "id,status_code,status");
+  const response = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  return handleResponse(response);
+}
+
+export async function publishMediaContainer(
+  accessToken: string,
+  containerId: string
+): Promise<{ id: string; permalink?: string }> {
+  const response = await fetch(`${instagramGraphBase()}/me/media_publish`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({ creation_id: containerId }),
+  });
+  const { id } = await handleResponse<{ id: string }>(response);
+
+  // The permalink is a nice-to-have for confirming the post; never fail the
+  // publish (which already happened) because this lookup did.
+  try {
+    const url = new URL(`${instagramGraphBase()}/${id}`);
+    url.searchParams.set("fields", "permalink");
+    const media = await handleResponse<{ permalink?: string }>(
+      await fetch(url.toString(), {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      })
+    );
+    return { id, permalink: media.permalink };
+  } catch {
+    return { id };
+  }
+}

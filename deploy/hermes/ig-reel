@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# ig-reel — publish a Reel through OpenInstaDM.
+#
+#   ig-reel --account <id|username> --video <file|https-url>
+#           [--caption-file <file> | --caption <text>]
+#           [--cover <image file|https-url> | --thumb-ms <ms>] [--no-feed]
+#
+# Meta downloads the video itself, so it needs a public https URL. Local files
+# (and downloaded links) are served from this machine through a temporary
+# Cloudflare quick tunnel that is torn down when the script exits. Nothing is
+# published until Instagram reports the video as processed.
+set -euo pipefail
+
+account="" video="" caption="" caption_file="" cover="" thumb_ms="" feed="true"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --account) account="$2"; shift 2 ;;
+    --video) video="$2"; shift 2 ;;
+    --caption) caption="$2"; shift 2 ;;
+    --caption-file) caption_file="$2"; shift 2 ;;
+    --cover) cover="$2"; shift 2 ;;
+    --thumb-ms) thumb_ms="$2"; shift 2 ;;
+    --no-feed) feed="false"; shift ;;
+    *) echo "opción desconocida: $1" >&2; exit 2 ;;
+  esac
+done
+[[ -n "$account" && -n "$video" ]] || {
+  echo "uso: ig-reel --account <id|usuario> --video <archivo|url> [--caption-file F] [--cover IMG | --thumb-ms MS] [--no-feed]" >&2
+  exit 2
+}
+if [[ -n "$caption_file" ]]; then caption="$(cat "$caption_file")"; fi
+if [[ -n "$thumb_ms" && ! "$thumb_ms" =~ ^[0-9]+$ ]]; then
+  echo "--thumb-ms debe ser un número de milisegundos" >&2; exit 2
+fi
+
+log() { echo "[ig-reel] $*" >&2; }
+
+# Resolve a username to the internal account id.
+account_id="$(ig GET /api/instagram/accounts | jq -er --arg a "${account#@}" \
+  '.data.instagramAccounts[] | select(.id == $a or .username == $a) | .id' | head -n1)" || {
+  echo "no encuentro la cuenta '$account' en OpenInstaDM" >&2; exit 1; }
+
+work="$(mktemp -d)"
+server_pid="" tunnel_pid=""
+cleanup() {
+  [[ -n "$tunnel_pid" ]] && kill "$tunnel_pid" 2>/dev/null || true
+  [[ -n "$server_pid" ]] && kill "$server_pid" 2>/dev/null || true
+  rm -rf "$work"
+}
+trap cleanup EXIT
+mkdir "$work/www"
+token="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+
+# Copy (or download) a file into the served folder under an unguessable name.
+stage() {
+  local src="$1" name="$2"
+  if [[ "$src" =~ ^https?:// ]]; then
+    curl -fsSL --max-time 600 -o "$work/www/$name" "$src"
+  else
+    [[ -r "$src" ]] || { echo "no puedo leer $src" >&2; exit 1; }
+    ln -s "$(readlink -f "$src")" "$work/www/$name"
+  fi
+}
+
+stage "$video" "$token.mp4"
+mime="$(file -bL --mime-type "$work/www/$token.mp4")"
+[[ "$mime" == video/* ]] || { echo "el vídeo no parece un vídeo ($mime)" >&2; exit 1; }
+if [[ -n "$cover" ]]; then
+  stage "$cover" "cover-src"
+  cmime="$(file -bL --mime-type "$work/www/cover-src")"
+  [[ "$cmime" == image/* ]] || { echo "la portada no es una imagen ($cmime)" >&2; exit 1; }
+  # Instagram wants a JPEG cover; convert PNG/WebP/HEIC-decoded images.
+  ffmpeg -loglevel error -y -i "$work/www/cover-src" -frames:v 1 -q:v 2 \
+    "$work/www/$token-cover.jpg"
+  rm -f "$work/www/cover-src"
+fi
+
+# Serve on localhost only; the tunnel is the sole way in.
+port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
+python3 -m http.server "$port" --bind 127.0.0.1 --directory "$work/www" \
+  >"$work/http.log" 2>&1 &
+server_pid=$!
+
+cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$port" \
+  >"$work/tunnel.log" 2>&1 &
+tunnel_pid=$!
+base=""
+for _ in $(seq 1 60); do
+  base="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$work/tunnel.log" | head -n1 || true)"
+  [[ -n "$base" ]] && break
+  sleep 1
+done
+[[ -n "$base" ]] || { echo "no se pudo abrir el túnel" >&2; tail -5 "$work/tunnel.log" >&2; exit 1; }
+for _ in $(seq 1 30); do
+  curl -fsI --max-time 10 "$base/$token.mp4" >/dev/null 2>&1 && break
+  sleep 2
+done
+log "vídeo servido temporalmente"
+
+body="$(jq -n \
+  --arg id "$account_id" --arg v "$base/$token.mp4" --arg c "$caption" \
+  --arg cover "${cover:+$base/$token-cover.jpg}" --arg t "$thumb_ms" \
+  --argjson feed "$feed" \
+  '{instagramAccountId: $id, videoUrl: $v, shareToFeed: $feed}
+   + (if $c != "" then {caption: $c} else {} end)
+   + (if $cover != "" then {coverUrl: $cover} else {} end)
+   + (if $t != "" then {thumbOffsetMs: ($t | tonumber)} else {} end)')"
+
+container="$(ig POST /api/instagram/reels "$body" | jq -er '.data.containerId')"
+log "contenedor $container creado; esperando a que Instagram procese el vídeo"
+
+# Instagram usually needs 30 s – a few minutes. Give up after 20 minutes.
+status=""
+for _ in $(seq 1 80); do
+  sleep 15
+  status="$(ig GET "/api/instagram/reels?instagramAccountId=$account_id&containerId=$container")"
+  code="$(jq -r '.data.statusCode' <<<"$status")"
+  case "$code" in
+    FINISHED) break ;;
+    ERROR|EXPIRED)
+      echo "Instagram rechazó el vídeo: $(jq -r '.data.status // "sin detalle"' <<<"$status")" >&2
+      exit 1 ;;
+  esac
+done
+[[ "$(jq -r '.data.statusCode' <<<"$status")" == FINISHED ]] || {
+  echo "Instagram no terminó de procesar el vídeo a tiempo (contenedor $container)" >&2; exit 1; }
+
+ig POST /api/instagram/reels/publish \
+  "$(jq -n --arg id "$account_id" --arg c "$container" '{instagramAccountId: $id, containerId: $c}')"

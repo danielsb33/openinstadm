@@ -52,11 +52,36 @@ explícito en el chat. Nunca encadenes envíos masivos.
 | Crear campaña | `ig POST /api/automations '{...}'` (mínimo `name`, `dmMessage`, `instagramAccountId` y `postId` o `matchAnyPost`, `keywords`) |
 | Borrar campaña | `ig DELETE '/api/automations?id=CAMP_ID'` (prefiere pausar) |
 
+## Publicar un Reel (SIEMPRE con confirmación)
+
+Usa `ig-reel`, que sirve el vídeo temporalmente, espera a que Instagram lo
+procese (puede tardar varios minutos) y lo publica:
+
+```
+ig-reel --account pink.trainer --video /ruta/video.mp4 \
+        --caption-file /tmp/caption.txt [--cover /ruta/portada.jpg | --thumb-ms 3000] [--no-feed]
+```
+
+- `--video`: archivo local (p. ej. el que te mandan por Telegram) o un enlace
+  directo de descarga. Debe ser MP4/MOV vertical (9:16), 3 s – 15 min.
+- Caption: escríbelo en un archivo y pásalo con `--caption-file` (evita
+  problemas con comillas y emojis). Máx. 2200 caracteres, 30 hashtags.
+- Portada: `--cover` con una imagen (se convierte a JPEG sola) o
+  `--thumb-ms` con el milisegundo del fotograma. Sin ninguna, Instagram elige.
+- `--no-feed`: el Reel no aparece en la cuadrícula del perfil.
+
+Antes de ejecutarlo, enseña al usuario: cuenta, vídeo, caption completo y
+portada, y espera un "sí" explícito. Publicar es irreversible desde aquí
+(solo se puede borrar en la app de Instagram). Al terminar, devuelve el
+`permalink`. Si sale 403 sobre permisos, la cuenta debe reconectarse en
+OpenInstaDM para conceder el permiso de publicación. Ejecuta `ig-reel` en
+segundo plano si tu herramienta tiene límite de tiempo: puede tardar >5 min.
+
 ## Límites que debes respetar
 
 - Instagram solo permite escribir por DM a quien escribió en las últimas 24 h.
-- No se puede publicar contenido (posts/reels) desde aquí: la app de Meta no
-  tiene ese permiso. Si lo piden, dilo y propón preparar el texto/caption.
+- Solo se pueden publicar Reels (no fotos, carruseles ni historias).
+- Instagram limita las publicaciones por API a unas 50 cada 24 h por cuenta.
 - Un 401 significa que la clave del agente falta o es incorrecta; un 403, que
   el usuario no tiene permiso en ese workspace. No reintentes en bucle.
 - Nunca muestres el contenido de `~/.hermes/openinstadm.header`.

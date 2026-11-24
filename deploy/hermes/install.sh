@@ -6,9 +6,18 @@ set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 
-sudo apt-get install -y -qq jq >/dev/null
+sudo apt-get install -y -qq jq ffmpeg file python3 >/dev/null
+# Cloudflare quick tunnels give ig-reel a temporary public https URL for videos.
+if ! command -v cloudflared >/dev/null; then
+  arch="$(dpkg --print-architecture)"
+  curl -fsSL -o /tmp/cloudflared.deb \
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$arch.deb"
+  sudo dpkg -i /tmp/cloudflared.deb >/dev/null
+  rm -f /tmp/cloudflared.deb
+fi
 mkdir -p "$HOME/.local/bin" "$HERMES_HOME/skills/openinstadm"
 install -m 755 "$SRC/ig" "$HOME/.local/bin/ig"
+install -m 755 "$SRC/ig-reel" "$HOME/.local/bin/ig-reel"
 install -m 644 "$SRC/SKILL.md" "$HERMES_HOME/skills/openinstadm/SKILL.md"
 
 HEADER_FILE="$HERMES_HOME/openinstadm.header"
