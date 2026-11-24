@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# ig — call the OpenInstaDM API as the AI agent.
+#
+#   ig GET  /api/instagram/accounts
+#   ig GET  '/api/instagram/overview?instagramAccountId=<id>&count=25'
+#   ig PATCH '/api/automations?id=<campaignId>' '{"isActive":false}'
+#
+# Auth header lives in a file (never on the command line, so it stays out of
+# `ps` and shell history). Create it once with install.sh.
+set -euo pipefail
+
+BASE="${OPENINSTADM_URL:-https://openinstadm-danielsb33.vercel.app}"
+HEADER_FILE="${OPENINSTADM_HEADER_FILE:-$HOME/.hermes/openinstadm.header}"
+
+method="${1:-}"
+path="${2:-}"
+body="${3:-}"
+
+if [[ -z "$method" || -z "$path" ]]; then
+  echo "uso: ig METODO /api/ruta [json]" >&2
+  exit 2
+fi
+if [[ ! -r "$HEADER_FILE" ]]; then
+  echo "falta $HEADER_FILE (ejecuta install.sh)" >&2
+  exit 2
+fi
+
+args=(-sS --fail-with-body --max-time 90 -X "$method"
+  -H @"$HEADER_FILE" -H "Accept: application/json")
+if [[ -n "${OPENINSTADM_WORKSPACE:-}" ]]; then
+  args+=(-H "x-workspace-id: $OPENINSTADM_WORKSPACE")
+fi
+if [[ -n "$body" ]]; then
+  args+=(-H "Content-Type: application/json" --data "$body")
+fi
+
+curl "${args[@]}" "$BASE$path"
+echo

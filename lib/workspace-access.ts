@@ -5,6 +5,7 @@ import type {
 } from "@/app/generated/prisma/client";
 import { cacheLife, cacheTag, revalidateTag } from "next/cache";
 import { cookies } from "next/headers";
+import { getAgentIdentity } from "@/lib/agent-auth";
 import { getCurrentUserId } from "@/lib/auth";
 import { prisma, withDbRetry } from "@/lib/db/client";
 import { ensureWorkspaceForUser } from "@/lib/workspace";
@@ -62,6 +63,12 @@ export function canManageBilling(role: WorkspaceRole) {
  * inner function which only touches the database.
  */
 export async function getCurrentWorkspaceContext(): Promise<WorkspaceContext | null> {
+  // An AI agent authenticated with AGENT_API_KEY acts as AGENT_USER_ID.
+  const agent = await getAgentIdentity();
+  if (agent) {
+    return getCachedWorkspaceContext(agent.userId, agent.requestedWorkspaceId);
+  }
+
   const userId = await getCurrentUserId();
   if (!userId) return null;
 
