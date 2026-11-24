@@ -70,7 +70,7 @@ if [[ -n "$cover" ]]; then
   cmime="$(file -bL --mime-type "$work/www/cover-src")"
   [[ "$cmime" == image/* ]] || { echo "la portada no es una imagen ($cmime)" >&2; exit 1; }
   # Instagram wants a JPEG cover; convert PNG/WebP/HEIC-decoded images.
-  ffmpeg -loglevel error -y -i "$work/www/cover-src" -frames:v 1 -q:v 2 \
+  ffmpeg -nostdin -loglevel error -y -i "$work/www/cover-src" -frames:v 1 -q:v 2 \
     "$work/www/$token-cover.jpg"
   rm -f "$work/www/cover-src"
 fi
